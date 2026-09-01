@@ -1,8 +1,9 @@
 name: Sync patch onto upstream
 
 # Keeps the `share-store-public` patch replayed on top of the newest upstream
-# release, so a ready-to-use branch already exists when someone needs to move up
-# a version.
+# release *within the version line this fork can consume* (see
+# `UPSTREAM_SERIES_RE`), so a ready-to-use branch already exists when someone
+# needs to move up a version.
 #
 # It never writes to `share-store-public` itself. Each run refreshes the
 # throwaway branch `share-store-public-next` and keeps a *single* standing issue
@@ -34,6 +35,16 @@ env:
   PATCH_BRANCH: share-store-public
   NEXT_BRANCH: share-store-public-next
   REPORT_TITLE: Upstream sync status
+  # The version line this fork can actually consume. `ShareStoreView` is
+  # `@available(iOS 16, ...)` through 5.1.x and `@available(iOS 18, ...)` from
+  # 5.2.0 on, while the app consuming this fork ships an iOS 16 deployment
+  # target -- so following "newest release overall" would hand it a branch it
+  # cannot compile against. Package-level `platforms` says iOS 15 in both, and
+  # is no help here; the constraint lives on the declaration.
+  #
+  # The type-check probe below encodes the same iOS 16 floor. These two are one
+  # decision expressed twice: raise them together, never one alone.
+  UPSTREAM_SERIES_RE: '^5\.1(\.[0-9]+)?$'
 
 jobs:
   sync:
@@ -50,20 +61,20 @@ jobs:
           git remote add upstream "$UPSTREAM"
           git fetch --quiet upstream --tags
 
-      - name: Resolve newest upstream release
+      - name: Resolve newest upstream release on our version line
         id: target
         run: |
-          # Plain X.Y or X.Y.Z only -- this deliberately skips the patch tags
-          # published from this repository, which carry a pre-release suffix.
-          # Sorting is git's own version sort, so this does not depend on
-          # whichever `sort` happens to be on the runner.
-          TAG=$(git tag -l --sort=v:refname | grep -E '^[0-9]+\.[0-9]+(\.[0-9]+)?$' | tail -1)
+          # Anchored X.Y or X.Y.Z within our line -- the trailing anchor also
+          # skips the patch tags published from this repository, which carry a
+          # pre-release suffix. Sorting is git's own version sort, so this does
+          # not depend on whichever `sort` happens to be on the runner.
+          TAG=$(git tag -l --sort=v:refname | grep -E "$UPSTREAM_SERIES_RE" | tail -1)
           if [ -z "$TAG" ]; then
-            echo "::error::No upstream release tag found."
+            echo "::error::No upstream release tag matches $UPSTREAM_SERIES_RE."
             exit 1
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Newest upstream release: $TAG"
+          echo "Newest upstream release on $UPSTREAM_SERIES_RE: $TAG"
 
       - name: Check whether the patch already sits on that release
         id: check
