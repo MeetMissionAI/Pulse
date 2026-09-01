@@ -1,20 +1,20 @@
 name: Sync patch onto upstream
 
 # Keeps the `share-store-public` patch replayed on top of the newest upstream
-# release, so a ready-to-use branch always exists when someone needs to move up
+# release, so a ready-to-use branch already exists when someone needs to move up
 # a version.
 #
 # It never writes to `share-store-public` itself. Each run refreshes the
-# throwaway branch `share-store-public-next` and keeps a *single* standing pull
-# request open against `share-store-public` -- upstream ships releases far more
-# often than this patch needs to move, and one PR per run would be pure noise.
+# throwaway branch `share-store-public-next` and keeps a *single* standing issue
+# describing where things stand -- upstream ships releases far more often than
+# this patch needs to move, and one notification per run would be pure noise.
 #
 # The type-check step is the point of the whole job. A clean cherry-pick only
-# proves the text still applies; it says nothing about whether the declarations
-# we widen still exist. If upstream renames `ShareStoreView` or reshapes its
-# `init`, the cherry-pick succeeds and the branch is silently useless. Building
-# a throwaway package *outside* the Pulse package is the only thing that
-# actually exercises the public surface.
+# proves the surrounding text is unchanged; it says nothing about whether the
+# declarations being widened still exist. If upstream renames `ShareStoreView`
+# or reshapes its `init`, the cherry-pick succeeds and the branch is silently
+# useless. Building a throwaway package *outside* the Pulse package is the only
+# thing that actually exercises the public surface.
 
 on:
   schedule:
@@ -23,7 +23,7 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
+  issues: write
 
 concurrency:
   group: sync-patch-onto-upstream
@@ -33,6 +33,7 @@ env:
   UPSTREAM: https://github.com/kean/Pulse.git
   PATCH_BRANCH: share-store-public
   NEXT_BRANCH: share-store-public-next
+  REPORT_TITLE: Upstream sync status
 
 jobs:
   sync:
@@ -78,20 +79,23 @@ jobs:
           fi
 
       - name: Replay the patch on the new release
+        id: replay
         if: steps.check.outputs.up_to_date == 'false'
         run: |
           TAG="${{ steps.target.outputs.tag }}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B "$NEXT_BRANCH" "refs/tags/$TAG"
-          if ! git cherry-pick "origin/$PATCH_BRANCH"; then
+          if git cherry-pick "origin/$PATCH_BRANCH"; then
+            echo "replayed=true" >> "$GITHUB_OUTPUT"
+          else
             git cherry-pick --abort || true
-            echo "::error::The patch does not replay cleanly on $TAG. Either the surrounding code moved, or upstream already widened these declarations and the patch is now redundant. Sort it out by hand."
-            exit 1
+            echo "replayed=false" >> "$GITHUB_OUTPUT"
+            echo "The patch does not replay onto $TAG. Reporting instead of failing."
           fi
 
       - name: Type-check the widened API from outside the package
-        if: steps.check.outputs.up_to_date == 'false'
+        if: steps.replay.outputs.replayed == 'true'
         run: |
           PROBE="$RUNNER_TEMP/probe"
           mkdir -p "$PROBE/Sources/ShareProbe"
@@ -134,13 +138,9 @@ jobs:
 
           swift build --package-path "$PROBE"
 
-      - name: Refresh the standing pull request
-        if: steps.check.outputs.up_to_date == 'false'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish the refreshed branch
+        if: steps.replay.outputs.replayed == 'true'
         run: |
-          TAG="${{ steps.target.outputs.tag }}"
-
           # A lease needs something to lease against, and on the very first run
           # the branch does not exist yet.
           if git ls-remote --exit-code --heads origin "$NEXT_BRANCH" >/dev/null 2>&1; then
@@ -149,26 +149,58 @@ jobs:
             git push origin "$NEXT_BRANCH"
           fi
 
-          OPEN=$(gh pr list --head "$NEXT_BRANCH" --base "$PATCH_BRANCH" --state open --json number --jq '.[].number')
-          if [ -n "$OPEN" ]; then
-            echo "Pull request #$OPEN is already open and now points at $TAG."
-            exit 0
+      - name: Keep one standing report
+        if: always() && steps.check.outputs.up_to_date == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.target.outputs.tag }}
+          REPLAYED: ${{ steps.replay.outputs.replayed }}
+        run: |
+          COMPARE="https://github.com/$GITHUB_REPOSITORY/compare/$PATCH_BRANCH...$NEXT_BRANCH"
+
+          if [ "$REPLAYED" = "true" ]; then
+            BODY=$(cat <<BODY
+          \`$NEXT_BRANCH\` now carries the patch on upstream \`$TAG\`, and a
+          throwaway package built outside Pulse confirms the widened
+          declarations are still reachable.
+
+          Diff against the branch consumers pin: $COMPARE
+
+          Merging is a deliberate act, not a formality. Moving \`$PATCH_BRANCH\`
+          forward changes which upstream release consumers get, so read the
+          upstream release notes -- the deployment target above all -- first.
+          After merging, publish a tag: the next run rewrites \`$NEXT_BRANCH\`,
+          and an untagged commit stops being referenceable the moment it does.
+          BODY
+          )
+          else
+            BODY=$(cat <<BODY
+          The patch no longer replays cleanly onto upstream \`$TAG\`, so
+          \`$NEXT_BRANCH\` was left untouched and nothing was published.
+
+          Either the surrounding code moved far enough that the conflict needs a
+          human, or upstream widened these declarations itself and the patch is
+          now redundant. Resolve it by hand on top of \`$TAG\`, push the result
+          to \`$PATCH_BRANCH\`, and tag it.
+
+          This issue is rewritten in place on every run, so it stays quiet until
+          the situation actually changes.
+          BODY
+          )
           fi
 
-          gh pr create \
-            --base "$PATCH_BRANCH" \
-            --head "$NEXT_BRANCH" \
-            --title "Replay ShareStoreView patch on upstream $TAG" \
-            --body "$(cat <<'BODY'
-          Opened automatically. The patch that makes `ShareStoreView` public has
-          been replayed on the newest upstream release, and a throwaway package
-          built outside Pulse confirms the widened declarations are still
-          reachable.
+          NUMBER=$(gh issue list --state open --json number,title \
+            --jq "[.[] | select(.title == \"$REPORT_TITLE\")] | first | .number // empty")
 
-          Merging is a deliberate act, not a formality: moving the patch branch
-          forward changes which upstream release consumers get, so read the
-          upstream release notes -- deployment target above all -- before
-          merging. Once merged, publish a tag, otherwise the commit stops being
-          referenceable as soon as the next replay rewrites this branch.
-          BODY
-          )"
+          if [ -n "$NUMBER" ]; then
+            gh issue edit "$NUMBER" --body "$BODY"
+            echo "Updated issue #$NUMBER."
+          else
+            gh issue create --title "$REPORT_TITLE" --body "$BODY"
+          fi
+
+          {
+            echo "## Upstream sync"
+            echo
+            echo "$BODY"
+          } >> "$GITHUB_STEP_SUMMARY"
