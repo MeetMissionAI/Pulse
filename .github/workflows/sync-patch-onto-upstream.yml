@@ -1,0 +1,174 @@
+name: Sync patch onto upstream
+
+# Keeps the `share-store-public` patch replayed on top of the newest upstream
+# release, so a ready-to-use branch always exists when someone needs to move up
+# a version.
+#
+# It never writes to `share-store-public` itself. Each run refreshes the
+# throwaway branch `share-store-public-next` and keeps a *single* standing pull
+# request open against `share-store-public` -- upstream ships releases far more
+# often than this patch needs to move, and one PR per run would be pure noise.
+#
+# The type-check step is the point of the whole job. A clean cherry-pick only
+# proves the text still applies; it says nothing about whether the declarations
+# we widen still exist. If upstream renames `ShareStoreView` or reshapes its
+# `init`, the cherry-pick succeeds and the branch is silently useless. Building
+# a throwaway package *outside* the Pulse package is the only thing that
+# actually exercises the public surface.
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-patch-onto-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/kean/Pulse.git
+  PATCH_BRANCH: share-store-public
+  NEXT_BRANCH: share-store-public-next
+
+jobs:
+  sync:
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream tags
+        run: |
+          git remote add upstream "$UPSTREAM"
+          git fetch --quiet upstream --tags
+
+      - name: Resolve newest upstream release
+        id: target
+        run: |
+          # Plain X.Y or X.Y.Z only -- this deliberately skips the patch tags
+          # published from this repository, which carry a pre-release suffix.
+          # Sorting is git's own version sort, so this does not depend on
+          # whichever `sort` happens to be on the runner.
+          TAG=$(git tag -l --sort=v:refname | grep -E '^[0-9]+\.[0-9]+(\.[0-9]+)?$' | tail -1)
+          if [ -z "$TAG" ]; then
+            echo "::error::No upstream release tag found."
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Newest upstream release: $TAG"
+
+      - name: Check whether the patch already sits on that release
+        id: check
+        run: |
+          TAG="${{ steps.target.outputs.tag }}"
+          # Peel to a commit: upstream tags may be annotated, and
+          # `--is-ancestor` wants commits on both sides.
+          if git merge-base --is-ancestor "refs/tags/$TAG^{commit}" "origin/$PATCH_BRANCH"; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+            echo "$PATCH_BRANCH already contains $TAG. Nothing to do."
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Replay the patch on the new release
+        if: steps.check.outputs.up_to_date == 'false'
+        run: |
+          TAG="${{ steps.target.outputs.tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$NEXT_BRANCH" "refs/tags/$TAG"
+          if ! git cherry-pick "origin/$PATCH_BRANCH"; then
+            git cherry-pick --abort || true
+            echo "::error::The patch does not replay cleanly on $TAG. Either the surrounding code moved, or upstream already widened these declarations and the patch is now redundant. Sort it out by hand."
+            exit 1
+          fi
+
+      - name: Type-check the widened API from outside the package
+        if: steps.check.outputs.up_to_date == 'false'
+        run: |
+          PROBE="$RUNNER_TEMP/probe"
+          mkdir -p "$PROBE/Sources/ShareProbe"
+
+          # The package identity of a path dependency comes from the directory
+          # name, not from the manifest, so this only resolves because the
+          # checkout directory is called `Pulse`.
+          cat > "$PROBE/Package.swift" <<EOF
+          // swift-tools-version:5.10
+          import PackageDescription
+
+          let package = Package(
+              name: "ShareProbe",
+              platforms: [.iOS(.v16), .macOS(.v13)],
+              dependencies: [.package(path: "$GITHUB_WORKSPACE")],
+              targets: [
+                  .target(name: "ShareProbe", dependencies: [
+                      .product(name: "Pulse", package: "Pulse"),
+                      .product(name: "PulseUI", package: "Pulse"),
+                  ])
+              ]
+          )
+          EOF
+
+          cat > "$PROBE/Sources/ShareProbe/Probe.swift" <<'EOF'
+          import SwiftUI
+          import Pulse
+          import PulseUI
+
+          // Touches every declaration this patch widens. Compiles only if all of
+          // them are reachable from outside the Pulse package.
+          @available(iOS 16, macOS 13, *)
+          enum ShareProbe {
+              static func makeSheet() -> some View {
+                  ShareStoreView(sessions: [], onDismiss: {})
+                      .environment(\.store, LoggerStore.shared)
+              }
+          }
+          EOF
+
+          swift build --package-path "$PROBE"
+
+      - name: Refresh the standing pull request
+        if: steps.check.outputs.up_to_date == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.target.outputs.tag }}"
+
+          # A lease needs something to lease against, and on the very first run
+          # the branch does not exist yet.
+          if git ls-remote --exit-code --heads origin "$NEXT_BRANCH" >/dev/null 2>&1; then
+            git push --force-with-lease origin "$NEXT_BRANCH"
+          else
+            git push origin "$NEXT_BRANCH"
+          fi
+
+          OPEN=$(gh pr list --head "$NEXT_BRANCH" --base "$PATCH_BRANCH" --state open --json number --jq '.[].number')
+          if [ -n "$OPEN" ]; then
+            echo "Pull request #$OPEN is already open and now points at $TAG."
+            exit 0
+          fi
+
+          gh pr create \
+            --base "$PATCH_BRANCH" \
+            --head "$NEXT_BRANCH" \
+            --title "Replay ShareStoreView patch on upstream $TAG" \
+            --body "$(cat <<'BODY'
+          Opened automatically. The patch that makes `ShareStoreView` public has
+          been replayed on the newest upstream release, and a throwaway package
+          built outside Pulse confirms the widened declarations are still
+          reachable.
+
+          Merging is a deliberate act, not a formality: moving the patch branch
+          forward changes which upstream release consumers get, so read the
+          upstream release notes -- deployment target above all -- before
+          merging. Once merged, publish a tag, otherwise the commit stops being
+          referenceable as soon as the next replay rewrites this branch.
+          BODY
+          )"
