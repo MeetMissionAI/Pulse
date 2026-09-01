@@ -6,9 +6,14 @@ name: Sync patch onto upstream
 # needs to move up a version.
 #
 # It never writes to `share-store-public` itself. Each run refreshes the
-# throwaway branch `share-store-public-next` and keeps a *single* standing issue
-# describing where things stand -- upstream ships releases far more often than
-# this patch needs to move, and one notification per run would be pure noise.
+# throwaway branch `share-store-public-next` and, once the replay checks out,
+# opens a pull request against `share-store-public` for a human to weigh.
+#
+# The standing issue is reserved for the one thing a pull request cannot carry:
+# the patch no longer landing. It is rewritten in place rather than reopened per
+# run, and closed as soon as a run comes back clean -- upstream ships releases
+# far more often than this patch needs to move, and one notification per run
+# would be pure noise.
 #
 # The type-check step is the point of the whole job. A clean cherry-pick only
 # proves the surrounding text is unchanged; it says nothing about whether the
@@ -25,6 +30,7 @@ on:
 permissions:
   contents: write
   issues: write
+  pull-requests: write
 
 concurrency:
   group: sync-patch-onto-upstream
@@ -106,7 +112,11 @@ jobs:
           fi
 
       - name: Type-check the widened API from outside the package
+        id: probe
         if: steps.replay.outputs.replayed == 'true'
+        # Swallowed here so a failing probe can be reported rather than just
+        # painting the run red; the last step re-raises it.
+        continue-on-error: true
         run: |
           PROBE="$RUNNER_TEMP/probe"
           mkdir -p "$PROBE/Sources/ShareProbe"
@@ -150,7 +160,7 @@ jobs:
           swift build --package-path "$PROBE"
 
       - name: Publish the refreshed branch
-        if: steps.replay.outputs.replayed == 'true'
+        if: steps.probe.outcome == 'success'
         run: |
           # A lease needs something to lease against, and on the very first run
           # the branch does not exist yet.
@@ -160,8 +170,8 @@ jobs:
             git push origin "$NEXT_BRANCH"
           fi
 
-      - name: Keep one standing report
-        if: always() && steps.check.outputs.up_to_date == 'false'
+      - name: Open or refresh the pull request
+        if: steps.probe.outcome == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # This repository is a fork, and `gh` resolves a fork's operations to
@@ -169,26 +179,53 @@ jobs:
           # has no business writing. Pin it.
           GH_REPO: ${{ github.repository }}
           TAG: ${{ steps.target.outputs.tag }}
-          REPLAYED: ${{ steps.replay.outputs.replayed }}
         run: |
-          COMPARE="https://github.com/$GITHUB_REPOSITORY/compare/$PATCH_BRANCH...$NEXT_BRANCH"
-
-          if [ "$REPLAYED" = "true" ]; then
-            BODY=$(cat <<BODY
-          \`$NEXT_BRANCH\` now carries the patch on upstream \`$TAG\`, and a
-          throwaway package built outside Pulse confirms the widened
-          declarations are still reachable.
-
-          Diff against the branch consumers pin: $COMPARE
+          TITLE="Move the patch onto upstream $TAG"
+          BODY=$(cat <<BODY
+          \`$NEXT_BRANCH\` carries the patch on upstream \`$TAG\`, and a throwaway
+          package built outside Pulse confirms the widened declarations are still
+          reachable.
 
           Merging is a deliberate act, not a formality. Moving \`$PATCH_BRANCH\`
           forward changes which upstream release consumers get, so read the
           upstream release notes -- the deployment target above all -- first.
           After merging, publish a tag: the next run rewrites \`$NEXT_BRANCH\`,
           and an untagged commit stops being referenceable the moment it does.
+
+          Leaving this open is a valid answer. The branch and this description are
+          refreshed in place on every run, so nothing rots while it waits.
           BODY
           )
+
+          NUMBER=$(gh pr list --state open --base "$PATCH_BRANCH" --head "$NEXT_BRANCH" \
+            --json number --jq 'first | .number // empty')
+
+          if [ -n "$NUMBER" ]; then
+            # The branch was just force-refreshed, so an open pull request already
+            # points at the new commit -- only its prose is stale.
+            gh pr edit "$NUMBER" --title "$TITLE" --body "$BODY"
+            echo "Updated PR #$NUMBER."
           else
+            gh pr create --base "$PATCH_BRANCH" --head "$NEXT_BRANCH" \
+              --title "$TITLE" --body "$BODY"
+          fi
+
+          {
+            echo "## Upstream sync"
+            echo
+            echo "$BODY"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep one standing report
+        if: always() && (steps.replay.outputs.replayed == 'false' || steps.probe.outcome == 'failure')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Same fork/parent hazard as above.
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.target.outputs.tag }}
+          REPLAYED: ${{ steps.replay.outputs.replayed }}
+        run: |
+          if [ "$REPLAYED" = "false" ]; then
             BODY=$(cat <<BODY
           The patch no longer replays cleanly onto upstream \`$TAG\`, so
           \`$NEXT_BRANCH\` was left untouched and nothing was published.
@@ -198,8 +235,23 @@ jobs:
           now redundant. Resolve it by hand on top of \`$TAG\`, push the result
           to \`$PATCH_BRANCH\`, and tag it.
 
-          This issue is rewritten in place on every run, so it stays quiet until
-          the situation actually changes.
+          This issue is rewritten in place on every run and closed as soon as a
+          run comes back clean, so it stays quiet until the situation changes.
+          BODY
+          )
+          else
+            BODY=$(cat <<BODY
+          The patch still replays onto upstream \`$TAG\`, but a throwaway package
+          built outside Pulse no longer compiles against it -- the declarations
+          this patch widens have been renamed, reshaped, or removed. Nothing was
+          published.
+
+          This is exactly the case a clean cherry-pick cannot detect. Read the log
+          of the failing step, rework the patch on top of \`$TAG\`, push the
+          result to \`$PATCH_BRANCH\`, and tag it.
+
+          This issue is rewritten in place on every run and closed as soon as a
+          run comes back clean, so it stays quiet until the situation changes.
           BODY
           )
           fi
@@ -219,3 +271,33 @@ jobs:
             echo
             echo "$BODY"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Close the standing report once a run comes back clean
+        if: steps.check.outputs.up_to_date == 'true' || steps.probe.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Same fork/parent hazard as above.
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          # A report that outlives the situation it described is worse than no
+          # report at all: it teaches everyone to ignore the issue tracker.
+          NUMBER=$(gh issue list --state open --json number,title \
+            --jq "[.[] | select(.title == \"$REPORT_TITLE\")] | first | .number // empty")
+          if [ -z "$NUMBER" ]; then
+            echo "No standing report open. Nothing to close."
+            exit 0
+          fi
+
+          gh issue close "$NUMBER" --comment "Nothing outstanding as of upstream \`$TAG\`. A later run opens a fresh report if that changes."
+          echo "Closed issue #$NUMBER."
+
+      - name: Surface the failed probe
+        if: steps.probe.outcome == 'failure'
+        env:
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          # The probe swallowed its own failure so the report could be written.
+          # Give the run the red it earned.
+          echo "::error::The widened API no longer type-checks against $TAG. See the standing issue."
+          exit 1
