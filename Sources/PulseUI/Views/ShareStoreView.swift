@@ -10,7 +10,7 @@ import Pulse
 import Combine
 
 @available(iOS 16, macOS 13, watchOS 9, visionOS 1, *)
-package struct ShareStoreView: View {
+public struct ShareStoreView: View {
     /// Preselected sessions.
     var sessions: Set<UUID> = []
     var onDismiss: () -> Void
@@ -21,12 +21,12 @@ package struct ShareStoreView: View {
 
     @Environment(\.store) private var store: LoggerStore
 
-    package init(sessions: Set<UUID> = [], onDismiss: @escaping () -> Void) {
+    public init(sessions: Set<UUID> = [], onDismiss: @escaping () -> Void) {
         self.sessions = sessions
         self.onDismiss = onDismiss
     }
 
-    package var body: some View {
+    public var body: some View {
         content
             .onAppear {
                 if !sessions.isEmpty {

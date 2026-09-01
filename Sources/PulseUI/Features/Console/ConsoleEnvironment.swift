@@ -132,7 +132,7 @@ private struct ConsoleRouterKey: EnvironmentKey {
 }
 
 extension EnvironmentValues {
-    package var store: LoggerStore {
+    public var store: LoggerStore {
         get { self[LoggerStoreKey.self] }
         set { self[LoggerStoreKey.self] = newValue }
     }
