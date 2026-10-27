@@ -211,7 +211,11 @@ public final class LoggerStore: @unchecked Sendable, Identifiable {
         viewContext.mergePolicy = NSMergePolicy.mergeByPropertyObjectTrump
         viewContext.userInfo[LoggerBlogDataStore.loggerStoreKey] = LoggerBlogDataStore(self)
 
-        if createSession {
+        // A store that didn't start its own session (readonly, archive) shows
+        // the latest one. Never replace a session that was just started: its
+        // record is saved asynchronously and the latest one could be from the
+        // previous launch.
+        if !createSession {
             let latestSession = try? viewContext.first(LoggerSessionEntity.self) {
                 $0.sortDescriptors = [NSSortDescriptor(keyPath: \LoggerSessionEntity.createdAt, ascending: false)]
             }

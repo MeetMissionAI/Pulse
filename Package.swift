@@ -19,6 +19,7 @@ let package = Package(
         .target(name: "Pulse"),
         .target(name: "PulseProxy", dependencies: ["Pulse"]),
         .target(name: "PulseUI", dependencies: ["Pulse"]),
+        .testTarget(name: "PulseTests", dependencies: ["Pulse"]),
     ],
     swiftLanguageVersions: [
       .v5
