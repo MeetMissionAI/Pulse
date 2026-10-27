@@ -32,10 +32,18 @@ public struct ShareStoreView: View {
                 if !sessions.isEmpty {
                     viewModel.sessions = sessions
                 } else if viewModel.sessions.isEmpty {
-                    viewModel.sessions = [store.session.id]
+                    viewModel.sessions = UserSettings.shared.isSharingAllSessionsByDefault ? allSessionIDs() : [store.session.id]
                 }
                 viewModel.store = store
             }
+    }
+
+    /// The IDs of all sessions in the store, always including the current one
+    /// (its record may not be saved yet).
+    private func allSessionIDs() -> Set<UUID> {
+        let request = NSFetchRequest<LoggerSessionEntity>(entityName: String(describing: LoggerSessionEntity.self))
+        let sessions = (try? store.viewContext.fetch(request)) ?? []
+        return Set(sessions.map(\.id)).union([store.session.id])
     }
 
     @ViewBuilder

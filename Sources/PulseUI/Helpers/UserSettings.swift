@@ -26,6 +26,11 @@ public final class UserSettings: ObservableObject {
     @AppStorage("com.github.kean.pulse.sharingOutput")
     public var sharingOutput: ShareStoreOutput = .store
 
+    /// If `true`, the "Share Logs" sheet preselects every session in the store
+    /// instead of only the current one when no sessions are passed to it.
+    /// Not persisted. By default, `false`.
+    public var isSharingAllSessionsByDefault = false
+
     // Deprecated in Pulse 5.1.
     @available(*, deprecated, message: "Replaced with listDisplayOptions.header.fields and listDisplayOptions.footer.fields")
     public var displayHeaders: [String] {
