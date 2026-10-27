@@ -1,9 +1,14 @@
 name: Sync patch onto upstream
 
-# Keeps the `share-store-public` patch replayed on top of the newest upstream
-# release *within the version line this fork can consume* (see
+# Keeps the `share-store-public` patch series replayed on top of the newest
+# upstream release *within the version line this fork can consume* (see
 # `UPSTREAM_SERIES_RE`), so a ready-to-use branch already exists when someone
 # needs to move up a version.
+#
+# The patch is every commit `share-store-public` carries on top of the upstream
+# release it sits on, however many that is. The replay takes the whole range,
+# never just the branch tip: cherry-picking the branch name alone lands only
+# its last commit and drops the rest without a word.
 #
 # It never writes to `share-store-public` itself. Each run refreshes the
 # throwaway branch `share-store-public-next` and, once the replay checks out,
@@ -17,10 +22,10 @@ name: Sync patch onto upstream
 #
 # The type-check step is the point of the whole job. A clean cherry-pick only
 # proves the surrounding text is unchanged; it says nothing about whether the
-# declarations being widened still exist. If upstream renames `ShareStoreView`
-# or reshapes its `init`, the cherry-pick succeeds and the branch is silently
-# useless. Building a throwaway package *outside* the Pulse package is the only
-# thing that actually exercises the public surface.
+# declarations the patch makes public still exist. If upstream renames
+# `ShareStoreView` or reshapes its `init`, the cherry-pick succeeds and the
+# branch is silently useless. Building a throwaway package *outside* the Pulse
+# package is the only thing that actually exercises the public surface.
 
 on:
   schedule:
@@ -95,23 +100,26 @@ jobs:
             echo "up_to_date=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Replay the patch on the new release
+      - name: Replay the patch series on the new release
         id: replay
         if: steps.check.outputs.up_to_date == 'false'
         run: |
           TAG="${{ steps.target.outputs.tag }}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Where the patch branch left upstream: everything after this point
+          # up to the branch tip is the patch, one commit or many.
+          BASE=$(git merge-base "origin/$PATCH_BRANCH" "refs/tags/$TAG^{commit}")
           git checkout -B "$NEXT_BRANCH" "refs/tags/$TAG"
-          if git cherry-pick "origin/$PATCH_BRANCH"; then
+          if git cherry-pick "$BASE..origin/$PATCH_BRANCH"; then
             echo "replayed=true" >> "$GITHUB_OUTPUT"
           else
             git cherry-pick --abort || true
             echo "replayed=false" >> "$GITHUB_OUTPUT"
-            echo "The patch does not replay onto $TAG. Reporting instead of failing."
+            echo "The patch series does not replay onto $TAG. Reporting instead of failing."
           fi
 
-      - name: Type-check the widened API from outside the package
+      - name: Type-check the patched public API from outside the package
         id: probe
         if: steps.replay.outputs.replayed == 'true'
         # Swallowed here so a failing probe can be reported rather than just
@@ -146,13 +154,18 @@ jobs:
           import Pulse
           import PulseUI
 
-          // Touches every declaration this patch widens. Compiles only if all of
-          // them are reachable from outside the Pulse package.
+          // Touches every declaration the patch series makes public, widened or
+          // added. Compiles only if all of them are reachable from outside the
+          // Pulse package.
           @available(iOS 16, macOS 13, *)
           enum ShareProbe {
               static func makeSheet() -> some View {
                   ShareStoreView(sessions: [], onDismiss: {})
                       .environment(\.store, LoggerStore.shared)
+              }
+
+              static func shareAllSessions() {
+                  UserSettings.shared.isSharingAllSessionsByDefault = true
               }
           }
           EOF
@@ -183,8 +196,8 @@ jobs:
           TITLE="Move the patch onto upstream $TAG"
           BODY=$(cat <<BODY
           \`$NEXT_BRANCH\` carries the patch on upstream \`$TAG\`, and a throwaway
-          package built outside Pulse confirms the widened declarations are still
-          reachable.
+          package built outside Pulse confirms every declaration the patch makes
+          public is still reachable.
 
           Merging is a deliberate act, not a formality. Moving \`$PATCH_BRANCH\`
           forward changes which upstream release consumers get, so read the
@@ -231,7 +244,7 @@ jobs:
           \`$NEXT_BRANCH\` was left untouched and nothing was published.
 
           Either the surrounding code moved far enough that the conflict needs a
-          human, or upstream widened these declarations itself and the patch is
+          human, or upstream made one of these changes itself and that commit is
           now redundant. Resolve it by hand on top of \`$TAG\`, push the result
           to \`$PATCH_BRANCH\`, and tag it.
 
@@ -243,8 +256,8 @@ jobs:
             BODY=$(cat <<BODY
           The patch still replays onto upstream \`$TAG\`, but a throwaway package
           built outside Pulse no longer compiles against it -- the declarations
-          this patch widens have been renamed, reshaped, or removed. Nothing was
-          published.
+          the patch makes public have been renamed, reshaped, or removed. Nothing
+          was published.
 
           This is exactly the case a clean cherry-pick cannot detect. Read the log
           of the failing step, rework the patch on top of \`$TAG\`, push the
@@ -299,5 +312,5 @@ jobs:
         run: |
           # The probe swallowed its own failure so the report could be written.
           # Give the run the red it earned.
-          echo "::error::The widened API no longer type-checks against $TAG. See the standing issue."
+          echo "::error::The patched public API no longer type-checks against $TAG. See the standing issue."
           exit 1
