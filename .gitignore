@@ -4,3 +4,18 @@
 xcuserdata/
 .swiftpm/
 Package.resolved
+
+# Local development tooling
+.worktrees/
+.handoff/
+.pr-review-loop/
+.superpowers/
+CLAUDE.local.md
+.claude/*.local.md
+.claude/*.local.json
+.claude/*.lock
+.claude/scratch/
+DerivedData/
+buildServer.json
+.compile
+.vscode
